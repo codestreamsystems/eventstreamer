@@ -19,6 +19,7 @@ namespace DispatcherFunction
         private static string RedisPrefix = "streamer:";
         private static IConfigurationRoot Config;
         private static string RedisConnectionString => Config["RedisConnectionString"];
+        private static string ApiBaseAddress => Config["ApiBaseAddress"];
         private static readonly Lazy<ConnectionMultiplexer> LazyConnection = new Lazy<ConnectionMultiplexer>(() => ConnectionMultiplexer.Connect(RedisConnectionString));
         private static ConnectionMultiplexer RedisConnection => LazyConnection.Value;
 
@@ -155,7 +156,27 @@ namespace DispatcherFunction
                 allvalues = allValues
             };
 
-            log.LogInformation($"Row for {playerId}: {JsonConvert.SerializeObject(o)}");
+            await PostToApi(playerId, o, log);
+
+        }
+
+        private static async Task PostToApi(string playerId, dynamic dp, ILogger log)
+        {
+            var payload = JsonConvert.SerializeObject(dp);
+            log.LogInformation($"Row for {playerId}: {payload}");
+
+            // Getting ready to post to API
+
+            //using (var http = new HttpClient())
+            //{
+            //    http.BaseAddress = new Uri(ApiBaseAddress);
+            //    var result = await http.PostAsync("/api/some/endpoint", new StringContent(payload));
+            //    if (!result.IsSuccessStatusCode)
+            //    {
+            //        var resultContent = await result.Content.ReadAsStringAsync();
+            //        log.LogCritical($"Unsuccessful post to api for PlayerId: {playerId} --> {result.StatusCode} | {result.ReasonPhrase} | {resultContent}");
+            //    }
+            //}
         }
 
         private static decimal InternalParse(string incoming)
