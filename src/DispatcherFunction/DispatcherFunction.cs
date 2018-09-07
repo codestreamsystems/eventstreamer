@@ -25,9 +25,12 @@ namespace DispatcherFunction
         private static string ApiRoute => Config["ApiRoute"];
         private static readonly Lazy<ConnectionMultiplexer> LazyConnection = new Lazy<ConnectionMultiplexer>(() => ConnectionMultiplexer.Connect(RedisConnectionString));
         private static ConnectionMultiplexer RedisConnection => LazyConnection.Value;
+        //TODO: should we potentially shorten the time to expiry? 24 hrs seems more than enough, maybe something like 6-8 hours?
+        //currently the data in redis is absolutely useless and there is no re-use of the data after the initial post to the api
+        private static TimeSpan RedisExpiryTime => TimeSpan.FromHours(8);
 
         [FunctionName("DispatcherFunction")]
-        public static async Task Run([EventHubTrigger("final-stream", Connection = "incomingEventHub")]
+        public static async Task Run([EventHubTrigger("livedata", Connection = "incomingEventHub")]
                 EventData[] messages, 
                 ILogger log,
                 ExecutionContext context)
@@ -67,24 +70,15 @@ namespace DispatcherFunction
 
         private static async Task ProcessPlayerAsync(string playerId, (DataPoint point, string strRepresentation)[] messages, ILogger log)
         {
-
             var cache = RedisConnection.GetDatabase();
-            var queueKey = $"{RedisPrefix}player:{playerId}:queue";
-            var startKey = $"{RedisPrefix}player:{playerId}:start";
+            var queueKey = QueueKey(playerId);
+            var startKey = StartKey(playerId);
 
-            // check if we have a start
-            var start = await cache.StringGetAsync(startKey);
-
-            if (start == RedisValue.Null)
-            {
-                //TODO: should we potentially shorten the time to expiry? 24 hrs seems more than enough, maybe something like 6-8 hours?
-                //currently the data in redis is absolutely useless and there is no re-use of the data after the initial post to the api
-                await cache.StringSetAsync(startKey, messages[0].point.Timestamp.Ticks, TimeSpan.FromDays(1));
-                start = messages[0].point.Timestamp.Ticks;
-            }
+            await SetSessionStartValueIfNeedsBe(messages[0].point.SessionId, messages[0].point.Timestamp.Ticks, RedisExpiryTime);
+            var start = await GetStartAndSetIfNeedsBe(cache, startKey, messages[0].point.Timestamp.Ticks);
 
             // we can try the processing
-            var startTimeStamp = new DateTime((long)start);
+            var startTimeStamp = new DateTime(start);
             var pushTime = false;
             foreach (var (px, kx) in messages)
             {
@@ -102,19 +96,39 @@ namespace DispatcherFunction
 
             if (pushTime)
             {
-                // call push time
-                log.LogInformation("Pushing time!");
                 await PushTimeAsync(playerId, log);
+            }
+        }
+
+        private static async Task<long> GetStartAndSetIfNeedsBe(IDatabase cache, string key, long ticks)
+        {
+            var startVal = await cache.StringGetAsync(key);
+            if (startVal == RedisValue.Null)
+            {
+                startVal = ticks;
+                await cache.StringSetAsync(key, startVal, RedisExpiryTime);
+            }
+            return (long)startVal;
+        }
+
+        private static async Task SetSessionStartValueIfNeedsBe(string sessionId, long ticks, TimeSpan expiryTime)
+        {
+            var cache = RedisConnection.GetDatabase();
+            var key = SessionStartKey(sessionId);
+            if (await cache.StringGetAsync(key) == RedisValue.Null)
+            {
+                await cache.StringSetAsync(key, ticks, expiryTime);
             }
         }
 
         private static async Task PushTimeAsync(string playerId, ILogger log)
         {
+            log.LogInformation("Pushing time!");
+
             // get the playerId queue and stuff
             var cache = RedisConnection.GetDatabase();
 
-            var queueKey = $"{RedisPrefix}player:{playerId}:queue";
-
+            var queueKey = QueueKey(playerId);
 
             DateTime? start = null;
 
@@ -126,9 +140,9 @@ namespace DispatcherFunction
 
                 if (value == RedisValue.Null)
                 {
-                    //TODO: Not sure if we should be throwing here, it will potentially cause loss of data for other players?
-                    //possibly just log critical and return?
-                    throw new Exception($"We've run out of queue for key: {queueKey}");
+                    log.LogCritical($"We've run out of queue for key: {queueKey}");
+                    return;
+                    //TODO previously we were throwing an exception here, need to confirm that not throwing is better.
                 };
 
                 var point = JsonConvert.DeserializeObject<DataPoint>(value);
@@ -154,12 +168,15 @@ namespace DispatcherFunction
                 allValues.Add(first.Names[i], value);
             }
 
+            var sessionStartTicks = await cache.StringGetAsync(SessionStartKey(first.SessionId));
+            var sessionStart = new DateTime((long) sessionStartTicks);
+
             var o = new
             {
                 ts = first.Timestamp,
                 deviceid = first.DeviceId,
                 sessionid = first.SessionId,
-                sessionstart = "",
+                sessionstart = sessionStart.ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fff'Z'"),
                 allvalues = allValues
             };
 
@@ -222,5 +239,9 @@ namespace DispatcherFunction
                 return (null, null);
             }
         }
+
+        private static string StartKey(string playerId) => $"{RedisPrefix}player:{playerId}:start";
+        private static string QueueKey(string playerId) => $"{RedisPrefix}player:{playerId}:queue";
+        private static string SessionStartKey(string sessionId) => $"{RedisPrefix}session-start:{sessionId}";
     }
 }
