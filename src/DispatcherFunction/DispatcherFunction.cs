@@ -8,6 +8,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
@@ -20,6 +22,7 @@ namespace DispatcherFunction
         private static IConfigurationRoot Config;
         private static string RedisConnectionString => Config["RedisConnectionString"];
         private static string ApiBaseAddress => Config["ApiBaseAddress"];
+        private static string ApiRoute => Config["ApiRoute"];
         private static readonly Lazy<ConnectionMultiplexer> LazyConnection = new Lazy<ConnectionMultiplexer>(() => ConnectionMultiplexer.Connect(RedisConnectionString));
         private static ConnectionMultiplexer RedisConnection => LazyConnection.Value;
 
@@ -74,6 +77,8 @@ namespace DispatcherFunction
 
             if (start == RedisValue.Null)
             {
+                //TODO: should we potentially shorten the time to expiry? 24 hrs seems more than enough, maybe something like 6-8 hours?
+                //currently the data in redis is absolutely useless and there is no re-use of the data after the initial post to the api
                 await cache.StringSetAsync(startKey, messages[0].point.Timestamp.Ticks, TimeSpan.FromDays(1));
                 start = messages[0].point.Timestamp.Ticks;
             }
@@ -121,6 +126,8 @@ namespace DispatcherFunction
 
                 if (value == RedisValue.Null)
                 {
+                    //TODO: Not sure if we should be throwing here, it will potentially cause loss of data for other players?
+                    //possibly just log critical and return?
                     throw new Exception($"We've run out of queue for key: {queueKey}");
                 };
 
@@ -139,11 +146,11 @@ namespace DispatcherFunction
             var first = buffer.First();
             var countOfFields = first.Values.Count;
 
-            var allValues = new Dictionary<string, string>();
+            var allValues = new Dictionary<string, decimal>();
             for (var i = 0; i < countOfFields; i++)
             {
                 // TODO: this is horrible, but is a quick way to fix the errors
-                var value = buffer.Average(x => InternalParse(x.Values[i])).ToString();
+                var value = buffer.Average(x => InternalParse(x.Values[i]));
                 allValues.Add(first.Names[i], value);
             }
 
@@ -156,27 +163,35 @@ namespace DispatcherFunction
                 allvalues = allValues
             };
 
-            await PostToApi(playerId, o, log);
+            await PostToApi(playerId, JsonConvert.SerializeObject(o), log);
 
         }
 
-        private static async Task PostToApi(string playerId, dynamic dp, ILogger log)
+        private static async Task PostToApi(string playerId, string dp, ILogger log)
         {
-            var payload = JsonConvert.SerializeObject(dp);
-            log.LogInformation($"Row for {playerId}: {payload}");
+            var payload = "{\"input\":[" + dp + "]}";
 
-            // Getting ready to post to API
+            log.LogInformation($"posting Row for {playerId}: {payload} to {ApiBaseAddress}{ApiRoute}");
 
-            //using (var http = new HttpClient())
-            //{
-            //    http.BaseAddress = new Uri(ApiBaseAddress);
-            //    var result = await http.PostAsync("/api/some/endpoint", new StringContent(payload));
-            //    if (!result.IsSuccessStatusCode)
-            //    {
-            //        var resultContent = await result.Content.ReadAsStringAsync();
-            //        log.LogCritical($"Unsuccessful post to api for PlayerId: {playerId} --> {result.StatusCode} | {result.ReasonPhrase} | {resultContent}");
-            //    }
-            //}
+            using (var http = new HttpClient())
+            {
+
+                http.BaseAddress = new Uri(ApiBaseAddress);
+                http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));//ACCEPT header
+                var payloadContent = new StringContent(payload);
+                payloadContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                var result = await http.PostAsync(ApiRoute, payloadContent);
+                if (result.IsSuccessStatusCode)
+                {
+                    //TODO: do we need to do anything on success? cleanup in redis?
+                    log.LogInformation($"Successful post to api for PlayerId: {playerId}");
+                }
+                else
+                {
+                    var resultContent = await result.Content.ReadAsStringAsync();
+                    log.LogCritical($"Unsuccessful post to api for PlayerId: {playerId} --> {result.StatusCode} | {result.ReasonPhrase} | {resultContent}");
+                }
+            }
         }
 
         private static decimal InternalParse(string incoming)
